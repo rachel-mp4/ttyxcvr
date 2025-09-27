@@ -8,16 +8,24 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf16"
 
+	"github.com/bluesky-social/indigo/api/atproto"
+	"github.com/bluesky-social/indigo/atproto/client"
+	"github.com/bluesky-social/indigo/atproto/identity"
+	"github.com/bluesky-social/indigo/atproto/syntax"
+	"github.com/bluesky-social/indigo/lex/util"
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/gorilla/websocket"
 	"github.com/rachel-mp4/lrcproto/gen/go"
+	"github.com/rachel-mp4/ttyxcvr/lex"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -60,20 +68,27 @@ type model struct {
 	width      int
 	height     int
 	error      *error
-	command    *string
+	prompt     textinput.Model
+	draft      *textinput.Model
+	sentmsg    *string
 	channels   *[]Channel
 	list       *list.Model
 	curchannel *Channel
 	wsurl      *string
 	lrcconn    *websocket.Conn
+	lexconn    *websocket.Conn
+	evtchan    chan []byte
 	cancel     func()
 	vp         *viewport.Model
 	msgs       map[uint32]*Message
+	myid       *uint32
 	renders    []*string
 	topic      *string
 	color      *uint32
 	nick       *string
 	handle     *string
+	signeturi  *string
+	xrpc       *PasswordClient
 }
 
 type Message struct {
@@ -140,36 +155,48 @@ func (d ChannelItemDelegate) Render(w io.Writer, m list.Model, index int, item l
 	var desc string
 	var uri string
 	var host string
+	var color *uint32
+	var author string
 	if i, ok := item.(ChannelItem); ok {
 		title = i.Title()
 		desc = i.Description()
-		host = subduedStyle.Render(fmt.Sprintf("(hosted by %s)", i.Host()))
+		author = fmt.Sprintf("(%s)", renderName(i.channel.Creator.DisplayName, i.channel.Creator.Handle))
+		host = subduedStyle.Render(fmt.Sprintf("(hosted on %s)", i.Host()))
 		if desc == "" {
 			desc = subduedStyle.Render("no provided description")
 		}
 		uri = i.URI()
+		color = i.channel.Creator.Color
 	} else {
 		return
 	}
 	if index == m.Index() {
-		greenStyle := lipgloss.NewStyle().Foreground(Green)
-		title = fmt.Sprintf("│%s %s", greenStyle.Render(title), host)
+		greenStyle := lipgloss.NewStyle().Foreground(ColorFromInt(color))
+		title = fmt.Sprintf("│%s %s", greenStyle.Render(title), author)
 		desc = fmt.Sprintf("│%s", desc)
 		uri = fmt.Sprintf("└%s", strings.Repeat("─", m.Width()-1))
 	} else {
 		s := lipgloss.NewStyle()
 		s = s.Foreground(subduedColor)
 		uri = s.Render(uri)
+		host = subduedStyle.Render(author)
 	}
 	fmt.Fprintf(w, "%s %s\n%s\n%s", title, host, desc, uri)
 }
 
 func initialModel() model {
+	prompt := textinput.New()
+	prompt.Prompt = ":"
+	nick := "wanderer"
+	color := uint32(33096)
 	return model{
 		state:  Splash,
 		mode:   Normal,
+		prompt: prompt,
 		width:  30,
 		height: 20,
+		nick:   &nick,
+		color:  &color,
 	}
 }
 func (m model) Init() tea.Cmd {
@@ -213,15 +240,111 @@ type channelsMsg struct{ channels []Channel }
 
 type errMsg struct{ err error }
 
+func login(handle string, secret string) tea.Cmd {
+	return func() tea.Msg {
+		hdl, err := syntax.ParseHandle(handle)
+		if err != nil {
+			err = errors.New("handle failed to parse: " + err.Error())
+			return errMsg{err}
+		}
+		id, err := identity.DefaultDirectory().LookupHandle(context.Background(), hdl)
+		if err != nil {
+			err = errors.New("handle failed to loopup: " + err.Error())
+			return errMsg{err}
+		}
+		xrpc := NewPasswordClient(id.DID.String(), id.PDSEndpoint())
+		err = xrpc.CreateSession(context.Background(), handle, secret)
+		if err != nil {
+			return errMsg{err}
+		}
+		return loggedInMsg{xrpc}
+	}
+}
+
+type loggedInMsg struct {
+	xrpc *PasswordClient
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case errMsg:
 		m.state = Error
 		m.error = &msg.err
+		return m, nil
+	case svMsg:
+		if m.myid != nil && msg.signetView.LrcId == *m.myid {
+			m.signeturi = &msg.signetView.URI
+			return m, nil
+		}
+
+	case loginMsg:
+		if len(msg.value) == 2 {
+			return m, login(msg.value[0], msg.value[1])
+		}
+	case loggedInMsg:
+		m.xrpc = msg.xrpc
+		return m, nil
+
+	case setMsg:
+		key, val, found := strings.Cut(msg.value, "=")
+		if !found {
+			return m, nil
+		}
+		switch key {
+		case "color", "c":
+			i, err := strconv.Atoi(val)
+			if err != nil {
+				return m, nil
+			}
+			b := uint32(i)
+			m.color = &b
+			if m.draft != nil {
+				m.draft.PromptStyle = lipgloss.NewStyle().Foreground(ColorFromInt(&b))
+			}
+			err = sendSet(m.evtchan, m.nick, m.handle, m.color)
+			if err != nil {
+				send(errMsg{err})
+			}
+			return m, nil
+		case "nick", "name", "n":
+			m.nick = &val
+			if m.draft != nil {
+				m.draft.Prompt = renderName(m.nick, m.handle) + " "
+			}
+			err := sendSet(m.evtchan, m.nick, m.handle, m.color)
+			if err != nil {
+				send(errMsg{err})
+			}
+			return m, nil
+		case "handle", "h", "at", "@":
+			m.handle = &val
+			if m.draft != nil {
+				m.draft.Prompt = renderName(m.nick, m.handle) + " "
+			}
+			err := sendSet(m.evtchan, m.nick, m.handle, m.color)
+			if err != nil {
+				send(errMsg{err})
+			}
+			return m, nil
+		}
 
 	case tea.WindowSizeMsg:
 		m.height = msg.Height
 		m.width = msg.Width
+		if m.vp != nil {
+			m.vp.Width = msg.Width
+			m.vp.Height = msg.Height - 2
+		}
+		if m.renders != nil {
+			for _, message := range m.msgs {
+				message.renderMessage(msg.Width)
+			}
+			m.vp.SetContent(JoinDeref(m.renders, ""))
+		}
+		if m.list != nil {
+			m.list.SetSize(msg.Width, msg.Height)
+		}
+		return m, nil
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -257,6 +380,7 @@ func (m model) updateConnected(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.error = &err
 			return m, nil
 		}
+		id := msg.e.Id
 		switch msg := msg.e.Msg.(type) {
 		case *lrcpb.Event_Ping:
 			return m, nil
@@ -268,6 +392,9 @@ func (m model) updateConnected(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = Error
 				m.error = &err
 				return m, nil
+			}
+			if msg.Init.Echoed != nil && *msg.Init.Echoed {
+				m.myid = msg.Init.Id
 			}
 			m.vp.SetContent(JoinDeref(m.renders, ""))
 			return m, nil
@@ -310,13 +437,235 @@ func (m model) updateConnected(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case *lrcpb.Event_Editbatch:
+			if id == nil {
+				return m, nil
+			}
+			err := editMessage(*id, msg.Editbatch.Edits, m.msgs, &m.renders, m.width)
+			if err != nil {
+				m.state = Error
+				m.error = &err
+				return m, nil
+			}
+			m.vp.SetContent(JoinDeref(m.renders, ""))
 			return m, nil
-
+		}
+	case tea.KeyMsg:
+		switch m.mode {
+		case Normal:
+			switch msg.String() {
+			case "i", "a":
+				m.mode = Insert
+				return m, m.draft.Focus()
+			case ":":
+				m.mode = Command
+				return m, m.prompt.Focus()
+			}
+		case Insert:
+			switch msg.String() {
+			case "esc":
+				m.mode = Normal
+				m.draft.Blur()
+				return m, nil
+			case "enter":
+				if m.sentmsg != nil {
+					if m.xrpc != nil && m.signeturi != nil {
+						var color64 *uint64
+						if m.color != nil {
+							c64 := uint64(*m.color)
+							color64 = &c64
+						}
+						lmr := lex.MessageRecord{
+							SignetURI: *m.signeturi,
+							Body:      *m.sentmsg,
+							Nick:      m.nick,
+							Color:     color64,
+							PostedAt:  syntax.DatetimeNow().String(),
+						}
+						m.draft.SetValue("")
+						m.sentmsg = nil
+						m.myid = nil
+						m.signeturi = nil
+						return m, tea.Batch(sendPub(m.lrcconn), createMSGCmd(m.xrpc, &lmr))
+					}
+					m.draft.SetValue("")
+					m.sentmsg = nil
+					return m, sendPub(m.lrcconn)
+				}
+				return m, nil
+			}
+		case Command:
+			switch msg.String() {
+			case "esc":
+				m.mode = Normal
+				m.prompt.Blur()
+				m.prompt.SetValue("")
+				return m, nil
+			case "enter":
+				m.mode = Normal
+				m.prompt.Blur()
+				v := m.prompt.Value()
+				m.prompt.SetValue("")
+				return m, evaluateCommand(v)
+			default:
+			}
 		}
 	}
-	vp, cmd := m.vp.Update(msg)
-	m.vp = &vp
-	return m, cmd
+	switch m.mode {
+	case Normal:
+		vp, cmd := m.vp.Update(msg)
+		m.vp = &vp
+		return m, cmd
+	case Command:
+		prompt, cmd := m.prompt.Update(msg)
+		m.prompt = prompt
+		return m, cmd
+	case Insert:
+		draft, cmd := m.draft.Update(msg)
+		if m.sentmsg == nil && draft.Value() != "" {
+			nv := draft.Value()
+			m.sentmsg = &nv
+			m.draft = &draft
+			return m, tea.Batch(cmd, sendInsert(m.lrcconn, nv, 0, true))
+		}
+		if m.sentmsg != nil && *m.sentmsg != draft.Value() {
+			draftutf16 := utf16.Encode([]rune(draft.Value()))
+			sentutf16 := utf16.Encode([]rune(*m.sentmsg))
+			edits := Diff(sentutf16, draftutf16)
+			m.draft = &draft
+			sentmsg := draft.Value()
+			m.sentmsg = &sentmsg
+			return m, tea.Batch(cmd, sendEditBatch(m.evtchan, edits))
+		}
+		m.draft = &draft
+		return m, cmd
+	}
+	return m, nil
+}
+
+func createMSGCmd(xrpc *PasswordClient, lmr *lex.MessageRecord) tea.Cmd {
+	return func() tea.Msg {
+		_, _, err := xrpc.CreateXCVRMessage(lmr, context.Background())
+		if err != nil {
+			return errMsg{err}
+		}
+		return nil
+	}
+}
+
+func sendEditBatch(datachan chan []byte, edits []Edit) tea.Cmd {
+	return func() tea.Msg {
+		idx := 0
+		batch := make([]*lrcpb.Edit, 0)
+		for _, edit := range edits {
+			switch edit.EditType {
+			case EditDel:
+				idx2 := idx + len(edit.Utf16Text)
+				evt := makeDelete(uint32(idx), uint32(idx2))
+				edit := lrcpb.Edit{Edit: &lrcpb.Edit_Delete{Delete: evt.GetDelete()}}
+				batch = append(batch, &edit)
+			case EditKeep:
+				idx = idx + len(edit.Utf16Text)
+			case EditAdd:
+				evt := makeInsert(string(utf16.Decode(edit.Utf16Text)), uint32(idx))
+				idx = idx + len(edit.Utf16Text)
+				edit := lrcpb.Edit{Edit: &lrcpb.Edit_Insert{Insert: evt.GetInsert()}}
+				batch = append(batch, &edit)
+			}
+		}
+		evt := lrcpb.Event{Msg: &lrcpb.Event_Editbatch{Editbatch: &lrcpb.EditBatch{Edits: batch}}}
+		data, err := proto.Marshal(&evt)
+		if err != nil {
+			return errMsg{err}
+		}
+		datachan <- data
+		return nil
+	}
+}
+
+func sendPub(conn *websocket.Conn) tea.Cmd {
+	return func() tea.Msg {
+		evt := &lrcpb.Event{Msg: &lrcpb.Event_Pub{Pub: &lrcpb.Pub{}}}
+		data, err := proto.Marshal(evt)
+		if err != nil {
+			return errMsg{err}
+		}
+		err = conn.WriteMessage(websocket.BinaryMessage, data)
+		if err != nil {
+			return errMsg{err}
+		}
+		return nil
+	}
+}
+
+func makeDelete(start uint32, end uint32) *lrcpb.Event {
+	evt := &lrcpb.Event{Msg: &lrcpb.Event_Delete{Delete: &lrcpb.Delete{Utf16Start: start, Utf16End: end}}}
+	return evt
+}
+
+func makeInsert(body string, idx uint32) *lrcpb.Event {
+	evt := &lrcpb.Event{Msg: &lrcpb.Event_Insert{Insert: &lrcpb.Insert{Body: body, Utf16Index: idx}}}
+	return evt
+}
+
+func sendInsert(conn *websocket.Conn, body string, utf16idx uint32, init bool) tea.Cmd {
+	return func() tea.Msg {
+		if init {
+			evt := &lrcpb.Event{Msg: &lrcpb.Event_Init{Init: &lrcpb.Init{}}}
+			data, err := proto.Marshal(evt)
+			if err != nil {
+				return errMsg{err}
+			}
+			if conn == nil {
+				return nil
+			}
+			err = conn.WriteMessage(websocket.BinaryMessage, data)
+			if err != nil {
+				return errMsg{err}
+			}
+		}
+		evt := &lrcpb.Event{Msg: &lrcpb.Event_Insert{Insert: &lrcpb.Insert{Body: body, Utf16Index: utf16idx}}}
+		data, err := proto.Marshal(evt)
+		if err != nil {
+			return errMsg{err}
+		}
+		err = conn.WriteMessage(websocket.BinaryMessage, data)
+		if err != nil {
+			return errMsg{err}
+		}
+		return nil
+	}
+}
+
+func evaluateCommand(command string) tea.Cmd {
+	return func() tea.Msg {
+		parts := strings.Split(command, " ")
+		if parts == nil {
+			return nil
+		}
+		switch parts[0] {
+		case "q":
+			return tea.QuitMsg{}
+		case "se", "set":
+			if len(parts) != 1 {
+				return setMsg{parts[1]}
+			}
+		case "resize":
+			return tea.WindowSize()
+		case "login":
+			if len(parts) != 1 {
+				return loginMsg{parts[1:]}
+			}
+		}
+		return nil
+	}
+}
+
+type loginMsg struct {
+	value []string
+}
+
+type setMsg struct {
+	value string
 }
 
 // i think that the type of renders is a bit awkward, but i want deletemessage + friends to just modify the rendered
@@ -372,6 +721,28 @@ func deleteBtwnUTF16Indices(base string, start uint32, end uint32) string {
 	result = append(result, baseUTF16Units[end:]...)
 	resultRunes := utf16.Decode(result)
 	return string(resultRunes)
+}
+
+func editMessage(id uint32, edits []*lrcpb.Edit, msgmap map[uint32]*Message, renders *[]*string, width int) error {
+	for _, edit := range edits {
+		switch e := edit.Edit.(type) {
+		case *lrcpb.Edit_Insert:
+			ins := e.Insert
+			ins.Id = &id
+			err := insertMessage(ins, msgmap, renders, width)
+			if err != nil {
+				return err
+			}
+		case *lrcpb.Edit_Delete:
+			del := e.Delete
+			del.Id = &id
+			err := deleteMessage(del, msgmap, renders, width)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func insertMessage(msg *lrcpb.Insert, msgmap map[uint32]*Message, renders *[]*string, width int) error {
@@ -474,20 +845,12 @@ func (m *Message) renderMessage(width int) {
 		return
 	}
 	stylem := lipgloss.NewStyle().Width(width).Align(lipgloss.Left)
-	styleh := stylem.Foreground(Green)
+	styleh := stylem.Foreground(ColorFromInt(m.color))
 	if m.active {
 		styleh = styleh.Reverse(true)
 		stylem = styleh
 	}
-	var nick string
-	if m.nick != nil {
-		nick = *m.nick
-	}
-	var handle string
-	if m.handle != nil && *m.handle != "" {
-		handle = fmt.Sprintf("@%s", *m.handle)
-	}
-	header := styleh.Render(fmt.Sprintf("%s%s", nick, handle))
+	header := styleh.Render(renderName(m.nick, m.handle))
 	body := stylem.Render(m.text)
 	*m.rendered = fmt.Sprintf("%s\n%s\n", header, body)
 }
@@ -498,28 +861,72 @@ func (m model) updateConnectingToChannel(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = Connected
 		m.cancel = msg.cancel
 		m.msgs = make(map[uint32]*Message)
-		vp := viewport.New(m.width, m.height-1)
+		vp := viewport.New(m.width, m.height-2)
 		m.vp = &vp
-		go startLRCHandlers(msg.conn)
+		draft := textinput.New()
+		draft.Prompt = renderName(m.nick, m.handle) + " "
+		draft.PromptStyle = lipgloss.NewStyle().Foreground(ColorFromInt(m.color))
+		draft.Placeholder = "press i to start typing"
+		draft.Width = m.width
+		m.draft = &draft
+		go startLRCHandlers(msg.conn, msg.lexconn, m.nick, m.handle, m.color)
+		m.lrcconn = msg.conn
+		m.lexconn = msg.lexconn
+		m.evtchan = make(chan []byte)
+		go LRCWriter(m.lrcconn, m.evtchan)
 		return m, nil
 	}
 	return m, nil
 }
 
-func startLRCHandlers(conn *websocket.Conn) {
+func LRCWriter(conn *websocket.Conn, datachan chan []byte) {
+	for data := range datachan {
+		err := conn.WriteMessage(websocket.BinaryMessage, data)
+		if err != nil {
+			send(errMsg{err})
+			return
+		}
+	}
+}
+
+func renderName(nick *string, handle *string) string {
+	var n string
+	if nick != nil {
+		n = *nick
+	}
+	var h string
+	if handle != nil {
+		h = fmt.Sprintf("@%s", *handle)
+	}
+	return fmt.Sprintf("%s%s", n, h)
+}
+
+func sendSet(datachan chan []byte, nick *string, handle *string, color *uint32) error {
+	evt := &lrcpb.Event{Msg: &lrcpb.Event_Set{Set: &lrcpb.Set{Nick: nick, ExternalID: handle, Color: color}}}
+	data, err := proto.Marshal(evt)
+	if err != nil {
+		return err
+	}
+	datachan <- data
+	return nil
+
+}
+
+func startLRCHandlers(conn *websocket.Conn, lexconn *websocket.Conn, nick *string, handle *string, color *uint32) {
 	if conn == nil {
 		send(errMsg{errors.New("provided nil conn")})
 		return
 	}
-	nick := "wanderer"
-	evt := &lrcpb.Event{Msg: &lrcpb.Event_Set{Set: &lrcpb.Set{Nick: &nick}}}
+	evt := &lrcpb.Event{Msg: &lrcpb.Event_Set{Set: &lrcpb.Set{Nick: nick, ExternalID: handle, Color: color}}}
 	data, err := proto.Marshal(evt)
 	if err != nil {
 		send(errMsg{errors.New("failed to marshal: " + err.Error())})
 		return
 	}
+	conn.WriteMessage(websocket.BinaryMessage, data)
 
-	evt = &lrcpb.Event{Msg: &lrcpb.Event_Get{Get: &lrcpb.Get{Topic: &nick}}}
+	bep := "bep"
+	evt = &lrcpb.Event{Msg: &lrcpb.Event_Get{Get: &lrcpb.Get{Topic: &bep}}}
 	data, err = proto.Marshal(evt)
 	if err != nil {
 		send(errMsg{errors.New("failed to marshal: " + err.Error())})
@@ -527,6 +934,52 @@ func startLRCHandlers(conn *websocket.Conn) {
 	}
 	conn.WriteMessage(websocket.BinaryMessage, data)
 	go listenToConn(conn)
+	go listenToLexConn(lexconn)
+}
+
+type typedJSON struct {
+	Type string `json:"$type"`
+}
+
+func listenToLexConn(conn *websocket.Conn) {
+	for {
+		var rawMsg json.RawMessage
+		err := conn.ReadJSON(&rawMsg)
+		if err != nil {
+			send(errMsg{err})
+			return
+		}
+		var typed typedJSON
+		err = json.Unmarshal(rawMsg, &typed)
+		if err != nil {
+			send(errMsg{err})
+			return
+		}
+		switch typed.Type {
+		case "org.xcvr.lrc.defs#signetView":
+			var sv SignetView
+			err = json.Unmarshal(rawMsg, &sv)
+			if err != nil {
+				send(errMsg{err})
+				return
+			}
+			send(svMsg{&sv})
+		}
+	}
+}
+
+type svMsg struct {
+	signetView *SignetView
+}
+
+type SignetView struct {
+	Type         string    `json:"$type,const=org.xcvr.lrc.defs#signetView"`
+	URI          string    `json:"uri"`
+	IssuerHandle string    `json:"issuerHandle"`
+	ChannelURI   string    `json:"channelURI"`
+	LrcId        uint32    `json:"lrcID"`
+	AuthorHandle string    `json:"authorHandle"`
+	StartedAt    time.Time `json:"startedAt"`
 }
 
 func listenToConn(conn *websocket.Conn) {
@@ -568,13 +1021,20 @@ func (m model) connectToChannel(ctx context.Context, cancel func()) tea.Cmd {
 		if err != nil {
 			return errMsg{err}
 		}
-		return connMsg{conn, cancel}
+
+		dialer = websocket.DefaultDialer
+		lexconn, _, err := dialer.DialContext(ctx, fmt.Sprintf("wss://xcvr.org/xrpc/org.xcvr.lrc.subscribeLexStream?uri=%s", m.curchannel.URI), http.Header{})
+		if err != nil {
+			return errMsg{err}
+		}
+		return connMsg{conn, lexconn, cancel}
 	}
 }
 
 type connMsg struct {
-	conn   *websocket.Conn
-	cancel func()
+	conn    *websocket.Conn
+	lexconn *websocket.Conn
+	cancel  func()
 }
 
 const (
@@ -707,16 +1167,26 @@ func (m model) connectedView() string {
 	}
 	remainingspace := m.width - len(address) - len(topic)
 	var footertext string
-	if remainingspace < 1 {
-		footertext = address
+	if m.mode == Command {
+		footertext = m.prompt.View()
+	} else if remainingspace < 1 {
+		footertext = fmt.Sprintf("%s%s", address, strings.Repeat(" ", m.width-len(address)))
 	} else {
 		footertext = fmt.Sprintf("%s%s%s", address, strings.Repeat(" ", remainingspace), topic)
 	}
 	insert := m.mode == Insert
-	footerstyle := lipgloss.NewStyle().Foreground(Green).Reverse(insert)
+	footerstyle := lipgloss.NewStyle().Reverse(insert)
+	if m.mode != Command {
+		footerstyle = footerstyle.Foreground(ColorFromInt(m.color))
+	}
 	footer := footerstyle.Render(footertext)
-	return fmt.Sprintf("%s\n%s", vpt, footer)
+	var draftText string
+	if m.draft != nil {
+		draftText = m.draft.View()
+	}
+	return fmt.Sprintf("%s\n%s\n%s", vpt, draftText, footer)
 }
+
 func (m model) connectingView() string {
 	blip := m.wsurl
 	if blip == nil {
@@ -731,7 +1201,11 @@ func (m model) channelListView() string {
 
 func (m model) splashView() string {
 	style := lipgloss.NewStyle().Foreground(Green)
-	part1 := "\n  %%%%%%%          "
+	part00 := "\n              ⣰⡀ ⢀⣀ ⡇ ⡇⡠   ⣰⡀ ⢀⡀   ⡀⢀ ⢀⡀ ⡀⢀ ⡇"
+	part01 := "\n              ⠘⠤ ⠣⠼ ⠣ ⠏⠢   ⠘⠤ ⠣⠜   ⣑⡺ ⠣⠜ ⠣⠼ ⠅"
+	part02 := "\n              ⣰⡀ ⡀⣀ ⢀⣀ ⣀⡀ ⢀⣀ ⢀⣀ ⢀⡀ ⠄ ⡀⢀ ⢀⡀ ⡀⣀"
+	part03 := "\n              ⠘⠤ ⠏  ⠣⠼ ⠇⠸ ⠭⠕ ⠣⠤ ⠣⠭ ⠇ ⠱⠃ ⠣⠭ ⠏"
+	part1 := "\n\n  %%%%%%%          "
 	text1 := "tty!xcvr\n"
 	part2 := ` %%%%%%%%%%  %%%            %   %           %%%%%%%%
    %%%%%%%%%%%%%%%%%        %%%%     %%%%%%%%%%%%%%%%%%
@@ -753,9 +1227,9 @@ func (m model) splashView() string {
                            press a key
                                 to start!
   `
-	s := fmt.Sprintf("%s%s%s%s%s%s%s%s%s", style.Render(part1), text1, style.Render(part2), style.Render(part25), text2, style.Render(part3), text3, style.Render(part4), text4)
-
-	return s
+	s := fmt.Sprintf("\n\n\n\n%s%s%s%s%s%s%s%s%s%s%s%s%s", style.Render(part00), style.Render(part01), style.Render(part02), style.Render(part03), style.Render(part1), text1, style.Render(part2), style.Render(part25), text2, style.Render(part3), text3, style.Render(part4), text4)
+	offset := lipgloss.NewStyle().MarginLeft((m.width - 58) / 2)
+	return offset.Render(s)
 }
 
 var send func(msg tea.Msg)
@@ -898,4 +1372,94 @@ func JoinDeref(elems []*string, sep string) string {
 		b.WriteString(*s)
 	}
 	return b.String()
+}
+
+type PasswordClient struct {
+	xrpc       *client.APIClient
+	accessjwt  *string
+	refreshjwt *string
+	did        *string
+}
+
+func NewPasswordClient(did string, host string) *PasswordClient {
+	return &PasswordClient{
+		xrpc: client.NewAPIClient(host),
+		did:  &did,
+	}
+}
+
+func (c *PasswordClient) CreateSession(ctx context.Context, identity string, secret string) error {
+	input := atproto.ServerCreateSession_Input{
+		Identifier: identity,
+		Password:   secret,
+	}
+	var out atproto.ServerCreateSession_Output
+	err := c.xrpc.LexDo(ctx, "POST", "application/json", "com.atproto.server.createSession", nil, input, &out)
+	if err != nil {
+		return errors.New("I couldn't create a session: " + err.Error())
+	}
+	c.accessjwt = &out.AccessJwt
+	c.refreshjwt = &out.RefreshJwt
+	return nil
+}
+
+func (c *PasswordClient) RefreshSession(ctx context.Context) error {
+	c.xrpc.Headers.Set("Authorization", fmt.Sprintf("Bearer %s", *c.refreshjwt))
+	var out atproto.ServerRefreshSession_Output
+	err := c.xrpc.LexDo(ctx, "POST", "application/json", "com.atproto.server.refreshSession", nil, nil, &out)
+	if err != nil {
+		return errors.New("failed to refresh session! " + err.Error())
+	}
+	c.accessjwt = &out.AccessJwt
+	c.refreshjwt = &out.RefreshJwt
+	return nil
+}
+
+func (c *PasswordClient) CreateXCVRMessage(message *lex.MessageRecord, ctx context.Context) (cid string, uri string, err error) {
+	input := atproto.RepoCreateRecord_Input{
+		Collection: "org.xcvr.lrc.message",
+		Repo:       *c.did,
+		Record:     &util.LexiconTypeDecoder{Val: message},
+	}
+	return c.createMyRecord(input, ctx)
+}
+
+func (c *PasswordClient) createMyRecord(input atproto.RepoCreateRecord_Input, ctx context.Context) (cid string, uri string, err error) {
+	if c.accessjwt == nil {
+		err = errors.New("must create a session first")
+		return
+	}
+	c.xrpc.Headers.Set("Authorization", fmt.Sprintf("Bearer %s", *c.accessjwt))
+	var out atproto.RepoCreateRecord_Output
+	err = c.xrpc.LexDo(ctx, "POST", "application/json", "com.atproto.repo.createRecord", nil, input, &out)
+	if err != nil {
+		err1 := err.Error()
+		err = c.RefreshSession(ctx)
+		if err != nil {
+			err = errors.New(fmt.Sprintf("failed to refresh session while creating %s! first %s then %s", input.Collection, err1, err.Error()))
+			return
+		}
+		c.xrpc.Headers.Set("Authorization", fmt.Sprintf("Bearer %s", *c.accessjwt))
+		out = atproto.RepoCreateRecord_Output{}
+		err = c.xrpc.LexDo(ctx, "POST", "application/json", "com.atproto.repo.createRecord", nil, input, &out)
+		if err != nil {
+			err = errors.New(fmt.Sprintf("not good, failed to create %s after failing then refreshing session! first %s then %s", input.Collection, err1, err.Error()))
+			return
+		}
+		cid = out.Cid
+		uri = out.Uri
+		return
+	}
+	cid = out.Cid
+	uri = out.Uri
+	return
+}
+
+func ColorFromInt(c *uint32) lipgloss.Color {
+	if c == nil {
+		return Green
+	}
+	ui := *c
+	guess := fmt.Sprintf("#%06x", ui)
+	return lipgloss.Color(guess[0:7])
 }
