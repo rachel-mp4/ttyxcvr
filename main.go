@@ -472,6 +472,14 @@ func (m model) updateConnected(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "i", "a":
 				m.mode = Insert
 				return m, m.draft.Focus()
+			case "I":
+				m.mode = Insert
+				m.draft.CursorStart()
+				return m, m.draft.Focus()
+			case "A":
+				m.mode = Insert
+				m.draft.CursorEnd()
+				return m, m.draft.Focus()
 			case ":":
 				m.mode = Command
 				return m, m.prompt.Focus()
