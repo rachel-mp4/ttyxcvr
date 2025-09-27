@@ -396,7 +396,11 @@ func (m model) updateConnected(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.Init.Echoed != nil && *msg.Init.Echoed {
 				m.myid = msg.Init.Id
 			}
+			ab := m.vp.AtBottom()
 			m.vp.SetContent(JoinDeref(m.renders, ""))
+			if ab {
+				m.vp.GotoBottom()
+			}
 			return m, nil
 		case *lrcpb.Event_Pub:
 			err := pubMessage(msg.Pub, m.msgs, m.width)
@@ -414,7 +418,11 @@ func (m model) updateConnected(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.error = &err
 				return m, nil
 			}
+			ab := m.vp.AtBottom()
 			m.vp.SetContent(JoinDeref(m.renders, ""))
+			if ab {
+				m.vp.GotoBottom()
+			}
 			return m, nil
 		case *lrcpb.Event_Delete:
 			err := deleteMessage(msg.Delete, m.msgs, &m.renders, m.width)
@@ -423,7 +431,11 @@ func (m model) updateConnected(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.error = &err
 				return m, nil
 			}
+			ab := m.vp.AtBottom()
 			m.vp.SetContent(JoinDeref(m.renders, ""))
+			if ab {
+				m.vp.GotoBottom()
+			}
 			return m, nil
 		case *lrcpb.Event_Mute:
 			return m, nil
@@ -446,7 +458,11 @@ func (m model) updateConnected(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.error = &err
 				return m, nil
 			}
+			ab := m.vp.AtBottom()
 			m.vp.SetContent(JoinDeref(m.renders, ""))
+			if ab {
+				m.vp.GotoBottom()
+			}
 			return m, nil
 		}
 	case tea.KeyMsg:
