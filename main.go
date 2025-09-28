@@ -1194,7 +1194,12 @@ func (m model) connectedView() string {
 	if m.mode == Command {
 		footertext = m.prompt.View()
 	} else if remainingspace < 1 {
-		footertext = fmt.Sprintf("%s%s", address, strings.Repeat(" ", m.width-len(address)))
+		addressremaining := m.width - len(address)
+		if addressremaining < 0 {
+			footertext = strings.Repeat(" ", m.width)
+		} else {
+			footertext = fmt.Sprintf("%s%s", address, strings.Repeat(" ", m.width-len(address)))
+		}
 	} else {
 		footertext = fmt.Sprintf("%s%s%s", address, strings.Repeat(" ", remainingspace), topic)
 	}
