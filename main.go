@@ -310,6 +310,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.nick = &val
 			if m.draft != nil {
 				m.draft.Prompt = renderName(m.nick, m.handle) + " "
+				m.draft.Width = m.width - len(m.draft.Prompt) - 1
 			}
 			err := sendSet(m.evtchan, m.nick, m.handle, m.color)
 			if err != nil {
@@ -320,6 +321,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.handle = &val
 			if m.draft != nil {
 				m.draft.Prompt = renderName(m.nick, m.handle) + " "
+				m.draft.Width = m.width - len(m.draft.Prompt) - 1
 			}
 			err := sendSet(m.evtchan, m.nick, m.handle, m.color)
 			if err != nil {
@@ -334,6 +336,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.vp != nil {
 			m.vp.Width = msg.Width
 			m.vp.Height = msg.Height - 2
+		}
+		if m.draft != nil {
+			m.draft.Width = m.width - len(m.draft.Prompt) - 1
 		}
 		if m.renders != nil {
 			for _, message := range m.msgs {
@@ -891,7 +896,7 @@ func (m model) updateConnectingToChannel(msg tea.Msg) (tea.Model, tea.Cmd) {
 		draft.Prompt = renderName(m.nick, m.handle) + " "
 		draft.PromptStyle = lipgloss.NewStyle().Foreground(ColorFromInt(m.color))
 		draft.Placeholder = "press i to start typing"
-		draft.Width = m.width
+		draft.Width = m.width - len(draft.Prompt) - 1
 		m.draft = &draft
 		go startLRCHandlers(msg.conn, msg.lexconn, m.nick, m.handle, m.color)
 		m.lrcconn = msg.conn
