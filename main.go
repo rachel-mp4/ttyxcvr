@@ -51,6 +51,7 @@ const (
 	ChannelList
 	ResolvingChannel
 	ConnectingToChannel
+	DialingChannel
 	Connected
 )
 
@@ -58,37 +59,52 @@ type txmode int
 
 const (
 	Normal txmode = iota
-	Command
 	Insert
 )
 
 type model struct {
-	state      txstate
-	mode       txmode
-	width      int
-	height     int
-	error      *error
-	prompt     textinput.Model
-	draft      *textinput.Model
-	sentmsg    *string
-	channels   *[]Channel
-	list       *list.Model
-	curchannel *Channel
-	wsurl      *string
-	lrcconn    *websocket.Conn
-	lexconn    *websocket.Conn
-	evtchan    chan []byte
-	cancel     func()
-	vp         *viewport.Model
-	msgs       map[uint32]*Message
-	myid       *uint32
-	renders    []*string
-	topic      *string
-	color      *uint32
-	nick       *string
-	handle     *string
-	signeturi  *string
-	xrpc       *PasswordClient
+	cmding bool
+	cmdout *string
+	error  *error
+	prompt textinput.Model
+	clm    *channellistmodel
+	cm     *channelmodel
+	gsd    *globalsettingsdata
+}
+
+type channellistmodel struct {
+	channels []Channel
+	list     list.Model
+	gsd      *globalsettingsdata
+}
+
+type channelmodel struct {
+	channel   Channel
+	mode      txmode
+	wsurl     string
+	lrcconn   *websocket.Conn
+	lexconn   *websocket.Conn
+	cancel    func()
+	vp        viewport.Model
+	draft     textinput.Model
+	msgs      map[uint32]*Message
+	myid      *uint32
+	render    []*string
+	sentmsg   *string
+	topic     *string
+	signeturi *string
+	datachan  chan []byte
+	gsd       *globalsettingsdata
+}
+
+type globalsettingsdata struct {
+	color  *uint32
+	nick   *string
+	handle *string
+	xrpc   *PasswordClient
+	width  int
+	height int
+	state  txstate
 }
 
 type Message struct {
@@ -187,16 +203,19 @@ func (d ChannelItemDelegate) Render(w io.Writer, m list.Model, index int, item l
 func initialModel() model {
 	prompt := textinput.New()
 	prompt.Prompt = ":"
+	prompt.Width = 28 //: + prompt.Width + 1 left over for blinky = initialWidth
 	nick := "wanderer"
 	color := uint32(33096)
-	return model{
-		state:  Splash,
-		mode:   Normal,
-		prompt: prompt,
-		width:  30,
-		height: 20,
+	gsd := globalsettingsdata{
 		nick:   &nick,
 		color:  &color,
+		width:  30,
+		height: 20,
+		state:  Splash,
+	}
+	return model{
+		prompt: prompt,
+		gsd:    &gsd,
 	}
 }
 func (m model) Init() tea.Cmd {
@@ -210,7 +229,7 @@ func (m model) updateSplash(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q":
 			return m, tea.Quit
 		default:
-			m.state = GettingChannels
+			m.gsd.state = GettingChannels
 			return m, GetChannels
 		}
 	}
@@ -265,16 +284,65 @@ type loggedInMsg struct {
 	xrpc *PasswordClient
 }
 
+func (cm *channelmodel) updateLRCIdentity() {
+	if cm != nil && cm.lrcconn != nil {
+		err := sendSet(cm.datachan, cm.gsd.nick, cm.gsd.handle, cm.gsd.color)
+		if err != nil {
+			send(errMsg{err})
+		}
+	}
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		if msg.String() == "ctrl+c" {
+			return m, tea.Quit
+		}
+		if m.cmdout != nil {
+			m.cmdout = nil
+			return m, nil
+		}
+		if (m.cm != nil && m.cm.mode == Insert) || (m.clm != nil && m.clm.list.FilterState() == list.Filtering) {
+			break
+		}
+		if !m.cmding {
+			if msg.String() == ":" {
+				m.cmding = true
+				return m, m.prompt.Focus()
+			}
+		} else {
+			switch msg.String() {
+			case "esc":
+				m.cmding = false
+				m.prompt.Blur()
+				m.prompt.SetValue("")
+				return m, nil
+			case "enter":
+				m.cmding = false
+				m.prompt.Blur()
+				v := m.prompt.Value()
+				m.prompt.SetValue("")
+				return m, m.evaluateCommand(v)
+			default:
+				p, cmd := m.prompt.Update(msg)
+				m.prompt = p
+				return m, cmd
+			}
+		}
 	case errMsg:
-		m.state = Error
+		m.gsd.state = Error
 		m.error = &msg.err
 		return m, nil
 	case svMsg:
-		if m.myid != nil && msg.signetView.LrcId == *m.myid {
-			m.signeturi = &msg.signetView.URI
+		if m.cm != nil && m.cm.myid != nil && msg.signetView.LrcId == *m.cm.myid {
+			m.cm.signeturi = &msg.signetView.URI
 			return m, nil
+		}
+	case dialMsg:
+		if len(msg.value) == 1 {
+			m.gsd.state = DialingChannel
+			return m, m.dialingChannel(msg.value)
 		}
 
 	case loginMsg:
@@ -282,7 +350,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, login(msg.value[0], msg.value[1])
 		}
 	case loggedInMsg:
-		m.xrpc = msg.xrpc
+		m.gsd.xrpc = msg.xrpc
 		return m, nil
 
 	case setMsg:
@@ -292,283 +360,258 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		switch key {
 		case "color", "c":
-			i, err := strconv.Atoi(val)
-			if err != nil {
-				return m, nil
+			var b uint32
+
+			if len(val) == 7 && val[0] == '#' {
+				b64, err := strconv.ParseUint(val[1:], 16, 0)
+				if err != nil {
+					return m, nil
+				}
+				b = uint32(b64)
+			} else {
+				i, err := strconv.Atoi(val)
+				if err != nil {
+					return m, nil
+				}
+				b = uint32(i)
 			}
-			b := uint32(i)
-			m.color = &b
-			if m.draft != nil {
-				m.draft.PromptStyle = lipgloss.NewStyle().Foreground(ColorFromInt(&b))
+			m.gsd.color = &b
+			if m.cm != nil {
+				m.cm.draft.PromptStyle = lipgloss.NewStyle().Foreground(ColorFromInt(&b))
 			}
-			err = sendSet(m.evtchan, m.nick, m.handle, m.color)
-			if err != nil {
-				send(errMsg{err})
-			}
+			m.cm.updateLRCIdentity()
 			return m, nil
 		case "nick", "name", "n":
-			m.nick = &val
-			if m.draft != nil {
-				m.draft.Prompt = renderName(m.nick, m.handle) + " "
-				m.draft.Width = m.width - len(m.draft.Prompt) - 1
+			m.gsd.nick = &val
+			if m.cm != nil {
+				m.cm.draft.Prompt = renderName(m.gsd.nick, m.gsd.handle) + " "
+				m.cm.draft.Width = m.gsd.width - len(m.cm.draft.Prompt) - 1
 			}
-			err := sendSet(m.evtchan, m.nick, m.handle, m.color)
-			if err != nil {
-				send(errMsg{err})
-			}
+			m.cm.updateLRCIdentity()
 			return m, nil
 		case "handle", "h", "at", "@":
-			m.handle = &val
-			if m.draft != nil {
-				m.draft.Prompt = renderName(m.nick, m.handle) + " "
-				m.draft.Width = m.width - len(m.draft.Prompt) - 1
+			m.gsd.handle = &val
+			if m.cm != nil {
+				m.cm.draft.Prompt = renderName(m.gsd.nick, m.gsd.handle) + " "
+				m.cm.draft.Width = m.gsd.width - len(m.cm.draft.Prompt) - 1
 			}
-			err := sendSet(m.evtchan, m.nick, m.handle, m.color)
-			if err != nil {
-				send(errMsg{err})
-			}
+			m.cm.updateLRCIdentity()
 			return m, nil
 		}
 
 	case tea.WindowSizeMsg:
-		m.height = msg.Height
-		m.width = msg.Width
-		if m.vp != nil {
-			m.vp.Width = msg.Width
-			m.vp.Height = msg.Height - 2
+		m.gsd.height = msg.Height
+		m.gsd.width = msg.Width
+		m.prompt.Width = msg.Width - 2
+		if m.clm != nil {
+			m.clm.list.SetSize(msg.Width, msg.Height-1)
 		}
-		if m.draft != nil {
-			m.draft.Width = m.width - len(m.draft.Prompt) - 1
-		}
-		if m.renders != nil {
-			for _, message := range m.msgs {
-				message.renderMessage(msg.Width)
+		if m.cm != nil {
+			m.cm.vp.Width = msg.Width
+			m.cm.vp.Height = msg.Height - 2
+			m.cm.draft.Width = m.gsd.width - len(m.cm.draft.Prompt) - 1
+			if m.cm.render != nil {
+				for _, message := range m.cm.msgs {
+					message.renderMessage(msg.Width)
+				}
+				m.cm.vp.SetContent(JoinDeref(m.cm.render, ""))
 			}
-			m.vp.SetContent(JoinDeref(m.renders, ""))
-		}
-		if m.list != nil {
-			m.list.SetSize(msg.Width, msg.Height)
 		}
 		return m, nil
-
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c":
-			return m, tea.Quit
-		}
 	}
 
-	switch m.state {
+	switch m.gsd.state {
 	case Splash:
 		return m.updateSplash(msg)
 	case GettingChannels:
 		return m.updateGettingChannels(msg)
 	case ChannelList:
-		return m.updateChannelList(msg)
+		clm, cmd, err := m.clm.updateChannelList(msg)
+		if err != nil {
+			m.gsd.state = Error
+			m.error = &err
+			return m, nil
+		}
+		m.clm = &clm
+		return m, cmd
 	case ResolvingChannel:
 		return m.updateResolvingChannel(msg)
 	case ConnectingToChannel:
 		return m.updateConnectingToChannel(msg)
+	case DialingChannel:
+
 	case Connected:
-		return m.updateConnected(msg)
+		cm, cmd, err := m.cm.updateConnected(msg)
+		if err != nil {
+			m.gsd.state = Error
+			m.error = &err
+			return m, nil
+		}
+		m.cm = &cm
+		return m, cmd
 	}
 
 	return m, nil
 }
 
-func (m model) updateConnected(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (cm channelmodel) updateConnected(msg tea.Msg) (channelmodel, tea.Cmd, error) {
 	switch msg := msg.(type) {
 	case lrcEvent:
 		if msg.e == nil {
-			m.state = Error
-			err := errors.New("nil lrcEvent")
-			m.error = &err
-			return m, nil
+			return cm, nil, errors.New("nil lrcEvent")
 		}
 		id := msg.e.Id
 		switch msg := msg.e.Msg.(type) {
 		case *lrcpb.Event_Ping:
-			return m, nil
+			return cm, nil, nil
 		case *lrcpb.Event_Pong:
-			return m, nil
+			return cm, nil, nil
 		case *lrcpb.Event_Init:
-			err := initMessage(msg.Init, m.msgs, &m.renders, m.width)
+			err := initMessage(msg.Init, cm.msgs, &cm.render, cm.gsd.width)
 			if err != nil {
-				m.state = Error
-				m.error = &err
-				return m, nil
+				return cm, nil, err
 			}
 			if msg.Init.Echoed != nil && *msg.Init.Echoed {
-				m.myid = msg.Init.Id
+				cm.myid = msg.Init.Id
 			}
-			ab := m.vp.AtBottom()
-			m.vp.SetContent(JoinDeref(m.renders, ""))
+			ab := cm.vp.AtBottom()
+			cm.vp.SetContent(JoinDeref(cm.render, ""))
 			if ab {
-				m.vp.GotoBottom()
+				cm.vp.GotoBottom()
 			}
-			return m, nil
+			return cm, nil, nil
 		case *lrcpb.Event_Pub:
-			err := pubMessage(msg.Pub, m.msgs, m.width)
+			err := pubMessage(msg.Pub, cm.msgs, cm.gsd.width)
 			if err != nil {
-				m.state = Error
-				m.error = &err
-				return m, nil
+				return cm, nil, err
 			}
-			m.vp.SetContent(JoinDeref(m.renders, ""))
-			return m, nil
+			cm.vp.SetContent(JoinDeref(cm.render, ""))
+			return cm, nil, err
 		case *lrcpb.Event_Insert:
-			err := insertMessage(msg.Insert, m.msgs, &m.renders, m.width)
+			err := insertMessage(msg.Insert, cm.msgs, &cm.render, cm.gsd.width)
 			if err != nil {
-				m.state = Error
-				m.error = &err
-				return m, nil
+				return cm, nil, err
 			}
-			ab := m.vp.AtBottom()
-			m.vp.SetContent(JoinDeref(m.renders, ""))
+			ab := cm.vp.AtBottom()
+			cm.vp.SetContent(JoinDeref(cm.render, ""))
 			if ab {
-				m.vp.GotoBottom()
+				cm.vp.GotoBottom()
 			}
-			return m, nil
+			return cm, nil, nil
 		case *lrcpb.Event_Delete:
-			err := deleteMessage(msg.Delete, m.msgs, &m.renders, m.width)
+			err := deleteMessage(msg.Delete, cm.msgs, &cm.render, cm.gsd.width)
 			if err != nil {
-				m.state = Error
-				m.error = &err
-				return m, nil
+				return cm, nil, err
 			}
-			ab := m.vp.AtBottom()
-			m.vp.SetContent(JoinDeref(m.renders, ""))
+			ab := cm.vp.AtBottom()
+			cm.vp.SetContent(JoinDeref(cm.render, ""))
 			if ab {
-				m.vp.GotoBottom()
+				cm.vp.GotoBottom()
 			}
-			return m, nil
+			return cm, nil, nil
 		case *lrcpb.Event_Mute:
-			return m, nil
+			return cm, nil, nil
 		case *lrcpb.Event_Unmute:
-			return m, nil
+			return cm, nil, nil
 		case *lrcpb.Event_Set:
-			return m, nil
+			return cm, nil, nil
 		case *lrcpb.Event_Get:
 			if msg.Get.Topic != nil {
-				m.topic = msg.Get.Topic
+				cm.topic = msg.Get.Topic
 			}
-			return m, nil
+			return cm, nil, nil
 		case *lrcpb.Event_Editbatch:
 			if id == nil {
-				return m, nil
+				return cm, nil, nil
 			}
-			err := editMessage(*id, msg.Editbatch.Edits, m.msgs, &m.renders, m.width)
+			err := editMessage(*id, msg.Editbatch.Edits, cm.msgs, &cm.render, cm.gsd.width)
 			if err != nil {
-				m.state = Error
-				m.error = &err
-				return m, nil
+				return cm, nil, err
 			}
-			ab := m.vp.AtBottom()
-			m.vp.SetContent(JoinDeref(m.renders, ""))
+			ab := cm.vp.AtBottom()
+			cm.vp.SetContent(JoinDeref(cm.render, ""))
 			if ab {
-				m.vp.GotoBottom()
+				cm.vp.GotoBottom()
 			}
-			return m, nil
+			return cm, nil, nil
 		}
 	case tea.KeyMsg:
-		switch m.mode {
+		switch cm.mode {
 		case Normal:
 			switch msg.String() {
 			case "i", "a":
-				m.mode = Insert
-				return m, m.draft.Focus()
+				cm.mode = Insert
+				return cm, cm.draft.Focus(), nil
 			case "I":
-				m.mode = Insert
-				m.draft.CursorStart()
-				return m, m.draft.Focus()
+				cm.mode = Insert
+				cm.draft.CursorStart()
+				return cm, cm.draft.Focus(), nil
 			case "A":
-				m.mode = Insert
-				m.draft.CursorEnd()
-				return m, m.draft.Focus()
-			case ":":
-				m.mode = Command
-				return m, m.prompt.Focus()
+				cm.mode = Insert
+				cm.draft.CursorEnd()
+				return cm, cm.draft.Focus(), nil
 			}
 		case Insert:
 			switch msg.String() {
 			case "esc":
-				m.mode = Normal
-				m.draft.Blur()
-				return m, nil
+				cm.mode = Normal
+				cm.draft.Blur()
+				return cm, nil, nil
 			case "enter":
-				if m.sentmsg != nil {
-					if m.xrpc != nil && m.signeturi != nil {
+				if cm.sentmsg != nil {
+					if cm.gsd.xrpc != nil && cm.signeturi != nil {
 						var color64 *uint64
-						if m.color != nil {
-							c64 := uint64(*m.color)
+						if cm.gsd.color != nil {
+							c64 := uint64(*cm.gsd.color)
 							color64 = &c64
 						}
 						lmr := lex.MessageRecord{
-							SignetURI: *m.signeturi,
-							Body:      *m.sentmsg,
-							Nick:      m.nick,
+							SignetURI: *cm.signeturi,
+							Body:      *cm.sentmsg,
+							Nick:      cm.gsd.nick,
 							Color:     color64,
 							PostedAt:  syntax.DatetimeNow().String(),
 						}
-						m.draft.SetValue("")
-						m.sentmsg = nil
-						m.myid = nil
-						m.signeturi = nil
-						return m, tea.Batch(sendPub(m.lrcconn), createMSGCmd(m.xrpc, &lmr))
+						cm.draft.SetValue("")
+						cm.sentmsg = nil
+						cm.myid = nil
+						cm.signeturi = nil
+						return cm, tea.Batch(sendPub(cm.lrcconn), createMSGCmd(cm.gsd.xrpc, &lmr)), nil
 					}
-					m.draft.SetValue("")
-					m.sentmsg = nil
-					return m, sendPub(m.lrcconn)
+					cm.draft.SetValue("")
+					cm.sentmsg = nil
+					return cm, sendPub(cm.lrcconn), nil
 				}
-				return m, nil
-			}
-		case Command:
-			switch msg.String() {
-			case "esc":
-				m.mode = Normal
-				m.prompt.Blur()
-				m.prompt.SetValue("")
-				return m, nil
-			case "enter":
-				m.mode = Normal
-				m.prompt.Blur()
-				v := m.prompt.Value()
-				m.prompt.SetValue("")
-				return m, evaluateCommand(v)
-			default:
+				return cm, nil, nil
 			}
 		}
 	}
-	switch m.mode {
+	switch cm.mode {
 	case Normal:
-		vp, cmd := m.vp.Update(msg)
-		m.vp = &vp
-		return m, cmd
-	case Command:
-		prompt, cmd := m.prompt.Update(msg)
-		m.prompt = prompt
-		return m, cmd
+		vp, cmd := cm.vp.Update(msg)
+		cm.vp = vp
+		return cm, cmd, nil
 	case Insert:
-		draft, cmd := m.draft.Update(msg)
-		if m.sentmsg == nil && draft.Value() != "" {
+		draft, cmd := cm.draft.Update(msg)
+		if cm.sentmsg == nil && draft.Value() != "" {
 			nv := draft.Value()
-			m.sentmsg = &nv
-			m.draft = &draft
-			return m, tea.Batch(cmd, sendInsert(m.lrcconn, nv, 0, true))
+			cm.sentmsg = &nv
+			cm.draft = draft
+			return cm, tea.Batch(cmd, sendInsert(cm.lrcconn, nv, 0, true)), nil
 		}
-		if m.sentmsg != nil && *m.sentmsg != draft.Value() {
+		if cm.sentmsg != nil && *cm.sentmsg != draft.Value() {
 			draftutf16 := utf16.Encode([]rune(draft.Value()))
-			sentutf16 := utf16.Encode([]rune(*m.sentmsg))
+			sentutf16 := utf16.Encode([]rune(*cm.sentmsg))
 			edits := Diff(sentutf16, draftutf16)
-			m.draft = &draft
+			cm.draft = draft
 			sentmsg := draft.Value()
-			m.sentmsg = &sentmsg
-			return m, tea.Batch(cmd, sendEditBatch(m.evtchan, edits))
+			cm.sentmsg = &sentmsg
+			return cm, tea.Batch(cmd, sendEditBatch(cm.datachan, edits)), nil
 		}
-		m.draft = &draft
-		return m, cmd
+		cm.draft = draft
+		return cm, cmd, nil
 	}
-	return m, nil
+	return cm, nil, nil
 }
 
 func createMSGCmd(xrpc *PasswordClient, lmr *lex.MessageRecord) tea.Cmd {
@@ -665,7 +708,7 @@ func sendInsert(conn *websocket.Conn, body string, utf16idx uint32, init bool) t
 	}
 }
 
-func evaluateCommand(command string) tea.Cmd {
+func (m model) evaluateCommand(command string) tea.Cmd {
 	return func() tea.Msg {
 		parts := strings.Split(command, " ")
 		if parts == nil {
@@ -684,9 +727,17 @@ func evaluateCommand(command string) tea.Cmd {
 			if len(parts) != 1 {
 				return loginMsg{parts[1:]}
 			}
+		case "dial":
+			if len(parts) != 1 {
+				return dialMsg{parts[1]}
+			}
 		}
 		return nil
 	}
+}
+
+type dialMsg struct {
+	value string
 }
 
 type loginMsg struct {
@@ -887,23 +938,52 @@ func (m *Message) renderMessage(width int) {
 func (m model) updateConnectingToChannel(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case connMsg:
-		m.state = Connected
-		m.cancel = msg.cancel
-		m.msgs = make(map[uint32]*Message)
-		vp := viewport.New(m.width, m.height-2)
-		m.vp = &vp
+		m.gsd.state = Connected
+		cm := channelmodel{}
+		cm.wsurl = msg.wsurl
+		cm.gsd = m.gsd
+		cm.cancel = msg.cancel
+		cm.msgs = make(map[uint32]*Message)
+		vp := viewport.New(m.gsd.width, m.gsd.height-2)
+		cm.vp = vp
 		draft := textinput.New()
-		draft.Prompt = renderName(m.nick, m.handle) + " "
-		draft.PromptStyle = lipgloss.NewStyle().Foreground(ColorFromInt(m.color))
+		draft.Prompt = renderName(m.gsd.nick, m.gsd.handle) + " "
+		draft.PromptStyle = lipgloss.NewStyle().Foreground(ColorFromInt(m.gsd.color))
 		draft.Placeholder = "press i to start typing"
-		draft.Width = m.width - len(draft.Prompt) - 1
-		m.draft = &draft
-		go startLRCHandlers(msg.conn, msg.lexconn, m.nick, m.handle, m.color)
-		m.lrcconn = msg.conn
-		m.lexconn = msg.lexconn
-		m.evtchan = make(chan []byte)
-		go LRCWriter(m.lrcconn, m.evtchan)
+		draft.Width = m.gsd.width - len(draft.Prompt) - 1
+		cm.draft = draft
+		go startLRCHandlers(msg.conn, m.gsd.nick, m.gsd.handle, m.gsd.color)
+		cm.lrcconn = msg.conn
+		cm.lexconn = msg.lexconn
+		cm.datachan = make(chan []byte)
+		go listenToLexConn(msg.lexconn)
+		go LRCWriter(cm.lrcconn, cm.datachan)
+		m.cm = &cm
+		m.clm = nil
 		return m, nil
+	}
+	return m, nil
+}
+
+func (m model) updateDialingChannel(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case connSimpleMsg:
+		m.gsd.state = Connected
+		cm := channelmodel{}
+		cm.gsd = m.gsd
+		cm.cancel = msg.cancel
+		cm.msgs = make(map[uint32]*Message)
+		vp := viewport.New(m.gsd.width, m.gsd.height-2)
+		cm.vp = vp
+		draft := textinput.New()
+		draft.Prompt = renderName(m.gsd.nick, m.gsd.handle) + " "
+		draft.PromptStyle = lipgloss.NewStyle().Foreground(ColorFromInt(m.gsd.color))
+		draft.Placeholder = "press i to start typing"
+		draft.Width = m.gsd.width - len(draft.Prompt) - 1
+		cm.draft = draft
+		go startLRCHandlers(msg.conn, m.gsd.nick, m.gsd.handle, m.gsd.color)
+		m.cm = &cm
+		m.clm = nil
 	}
 	return m, nil
 }
@@ -941,7 +1021,7 @@ func sendSet(datachan chan []byte, nick *string, handle *string, color *uint32) 
 
 }
 
-func startLRCHandlers(conn *websocket.Conn, lexconn *websocket.Conn, nick *string, handle *string, color *uint32) {
+func startLRCHandlers(conn *websocket.Conn, nick *string, handle *string, color *uint32) {
 	if conn == nil {
 		send(errMsg{errors.New("provided nil conn")})
 		return
@@ -963,7 +1043,6 @@ func startLRCHandlers(conn *websocket.Conn, lexconn *websocket.Conn, nick *strin
 	}
 	conn.WriteMessage(websocket.BinaryMessage, data)
 	go listenToConn(conn)
-	go listenToLexConn(lexconn)
 }
 
 type typedJSON struct {
@@ -1030,33 +1109,58 @@ type connwriterexitMsg struct{}
 func (m model) updateResolvingChannel(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case resolutionMsg:
-		wsurl := fmt.Sprintf("%s%s", m.curchannel.Host, msg.resolution.URL)
-		m.wsurl = &wsurl
-		m.state = ConnectingToChannel
+		c := m.clm.curchannel()
+		var host string
+		if c != nil {
+			host = c.Host
+		}
+		wsurl := fmt.Sprintf("%s%s", host, msg.resolution.URL)
+		m.gsd.state = ConnectingToChannel
 		ctx, cancel := context.WithCancel(context.Background())
-		return m, m.connectToChannel(ctx, cancel)
+		return m, m.connectToChannel(ctx, cancel, wsurl)
 	}
 	return m, nil
 }
 
-func (m model) connectToChannel(ctx context.Context, cancel func()) tea.Cmd {
+func (m model) dialingChannel(url string) tea.Cmd {
 	return func() tea.Msg {
 		dialer := websocket.DefaultDialer
 		dialer.Subprotocols = []string{"lrc.v1"}
-		if m.wsurl == nil {
-			return errMsg{errors.New("nil wsurl!")}
+		ctx, cancel := context.WithCancel(context.Background())
+		conn, _, err := dialer.DialContext(ctx, fmt.Sprintf("wss://%s", url), http.Header{})
+		if err != nil {
+			cancel()
+			return errMsg{err}
 		}
-		conn, _, err := dialer.DialContext(ctx, fmt.Sprintf("wss://%s", *m.wsurl), http.Header{})
+		return connSimpleMsg{conn, cancel}
+	}
+}
+
+type connSimpleMsg struct {
+	conn   *websocket.Conn
+	cancel func()
+}
+
+func (m model) connectToChannel(ctx context.Context, cancel func(), wsurl string) tea.Cmd {
+	return func() tea.Msg {
+		dialer := websocket.DefaultDialer
+		dialer.Subprotocols = []string{"lrc.v1"}
+		conn, _, err := dialer.DialContext(ctx, fmt.Sprintf("wss://%s", wsurl), http.Header{})
 		if err != nil {
 			return errMsg{err}
 		}
 
 		dialer = websocket.DefaultDialer
-		lexconn, _, err := dialer.DialContext(ctx, fmt.Sprintf("wss://xcvr.org/xrpc/org.xcvr.lrc.subscribeLexStream?uri=%s", m.curchannel.URI), http.Header{})
+		c := m.clm.curchannel()
+		var uri string
+		if c != nil {
+			uri = c.URI
+		}
+		lexconn, _, err := dialer.DialContext(ctx, fmt.Sprintf("wss://xcvr.org/xrpc/org.xcvr.lrc.subscribeLexStream?uri=%s", uri), http.Header{})
 		if err != nil {
 			return errMsg{err}
 		}
-		return connMsg{conn, lexconn, cancel}
+		return connMsg{conn, lexconn, cancel, wsurl}
 	}
 }
 
@@ -1064,6 +1168,7 @@ type connMsg struct {
 	conn    *websocket.Conn
 	lexconn *websocket.Conn
 	cancel  func()
+	wsurl   string
 }
 
 const (
@@ -1074,57 +1179,58 @@ const (
 func (m model) updateGettingChannels(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case channelsMsg:
+		clm := channellistmodel{}
 		items := make([]list.Item, 0, len(msg.channels))
 		for _, channel := range msg.channels {
 			items = append(items, ChannelItem{channel})
 		}
-		list := list.New(items, ChannelItemDelegate{}, m.width, m.height)
+		list := list.New(items, ChannelItemDelegate{}, m.gsd.width, m.gsd.height-1)
 		list.Styles = defaultStyles()
 		list.Title = "org.xcvr.feed.getChannels"
-		m.list = &list
-		m.state = ChannelList
+		clm.list = list
+		m.gsd.state = ChannelList
+		clm.gsd = m.gsd
+		m.clm = &clm
 		return m, nil
 	}
 	return m, nil
 }
 
-func (m model) updateChannelList(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if m.list == nil {
-		err := errors.New("no list!")
-		m.error = &err
-		m.state = Error
-		return m, nil
+func (clm channellistmodel) curchannel() *Channel {
+	switch i := clm.list.SelectedItem().(type) {
+	case ChannelItem:
+		return &i.channel
 	}
+	return nil
+}
+
+func (clm channellistmodel) updateChannelList(msg tea.Msg) (channellistmodel, tea.Cmd, error) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "enter":
-			m.state = ResolvingChannel
-			i, ok := m.list.SelectedItem().(ChannelItem)
-			if ok {
-				uri := i.URI()
+			if clm.list.FilterState() == list.Filtering {
+				break
+			}
+			clm.gsd.state = ResolvingChannel
+			cc := clm.curchannel()
+			if cc != nil {
+				uri := cc.URI
 				did, _ := DidFromUri(uri)
 				rkey, err := RkeyFromUri(uri)
 				if err != nil {
-					m.error = &err
-					m.state = Error
-					return m, nil
+					return clm, nil, err
 				}
-				m.curchannel = &i.channel
-				m.list = nil
-				m.channels = nil
-				return m, ResolveChannel(i.Host(), did, rkey)
+				return clm, ResolveChannel(cc.Host, did, rkey), nil
 			} else {
 				err := errors.New("bad list type")
-				m.error = &err
-				m.state = Error
-				return m, nil
+				return clm, nil, err
 			}
 		}
 	}
-	list, cmd := m.list.Update(msg)
-	m.list = &list
-	return m, cmd
+	list, cmd := clm.list.Update(msg)
+	clm.list = list
+	return clm, cmd, nil
 }
 
 func ResolveChannel(host string, did string, rkey string) tea.Cmd {
@@ -1158,7 +1264,11 @@ type Resolution struct {
 }
 
 func (m model) View() string {
-	switch m.state {
+	var pv string
+	if m.cmding {
+		pv = m.prompt.View()
+	}
+	switch m.gsd.state {
 	case Splash:
 		return m.splashView()
 	case GettingChannels:
@@ -1169,68 +1279,62 @@ func (m model) View() string {
 		}
 		return "broke so bad there isn't an error"
 	case ChannelList:
-		return m.channelListView()
+		return m.clm.channelListView(m.cmding, pv)
 	case ResolvingChannel:
 		return "resolving channel"
 	case ConnectingToChannel:
 		return m.connectingView()
 	case Connected:
-		return m.connectedView()
+		return m.cm.connectedView(m.cmding, pv)
 	default:
 		return "under construction"
 	}
 }
 
-func (m model) connectedView() string {
-	var vpt string
-	if m.vp != nil {
-		vpt = m.vp.View()
-	}
-	address := "lrc://"
-	if m.wsurl != nil {
-		address = fmt.Sprintf("%s%s", address, *m.wsurl)
-	}
-	var topic string
-	if m.topic != nil {
-		topic = *m.topic
-	}
-	remainingspace := m.width - len(address) - len(topic)
-	var footertext string
-	if m.mode == Command {
-		footertext = m.prompt.View()
-	} else if remainingspace < 1 {
-		addressremaining := m.width - len(address)
-		if addressremaining < 0 {
-			footertext = strings.Repeat(" ", m.width)
-		} else {
-			footertext = fmt.Sprintf("%s%s", address, strings.Repeat(" ", m.width-len(address)))
-		}
+func (cm channelmodel) connectedView(cmding bool, prompt string) string {
+	vpt := cm.vp.View()
+	var footer string
+	if cmding {
+		footer = prompt
 	} else {
-		footertext = fmt.Sprintf("%s%s%s", address, strings.Repeat(" ", remainingspace), topic)
+		address := "lrc://"
+		address = fmt.Sprintf("%s%s", address, cm.wsurl)
+		var topic string
+		if cm.topic != nil {
+			topic = *cm.topic
+		}
+		remainingspace := cm.gsd.width - len(address) - len(topic)
+		var footertext string
+		if remainingspace < 1 {
+			addressremaining := cm.gsd.width - len(address)
+			if addressremaining < 0 {
+				footertext = strings.Repeat(" ", cm.gsd.width)
+			} else {
+				footertext = fmt.Sprintf("%s%s", address, strings.Repeat(" ", cm.gsd.width-len(address)))
+			}
+		} else {
+			footertext = fmt.Sprintf("%s%s%s", address, strings.Repeat(" ", remainingspace), topic)
+		}
+		insert := cm.mode == Insert
+		footerstyle := lipgloss.NewStyle().Reverse(insert)
+		footerstyle = footerstyle.Foreground(ColorFromInt(cm.gsd.color))
+		footer = footerstyle.Render(footertext)
 	}
-	insert := m.mode == Insert
-	footerstyle := lipgloss.NewStyle().Reverse(insert)
-	if m.mode != Command {
-		footerstyle = footerstyle.Foreground(ColorFromInt(m.color))
-	}
-	footer := footerstyle.Render(footertext)
-	var draftText string
-	if m.draft != nil {
-		draftText = m.draft.View()
-	}
+	draftText := cm.draft.View()
 	return fmt.Sprintf("%s\n%s\n%s", vpt, draftText, footer)
 }
 
 func (m model) connectingView() string {
-	blip := m.wsurl
-	if blip == nil {
-		return "resolving channel\nSOMETHING WENT HORRIBLY WRONG"
-	}
-	return fmt.Sprintf("resolving channel\nconnecting to %s", *m.wsurl)
+	return "resolving channel\nconnecting to channel"
 }
 
-func (m model) channelListView() string {
-	return m.list.View()
+func (clm channellistmodel) channelListView(cmding bool, prompt string) string {
+	lv := clm.list.View()
+	cv := ""
+	if cmding {
+		cv = prompt
+	}
+	return fmt.Sprintf("%s\n%s", lv, cv)
 }
 
 func (m model) splashView() string {
@@ -1262,7 +1366,7 @@ func (m model) splashView() string {
                                 to start!
   `
 	s := fmt.Sprintf("\n\n\n\n%s%s%s%s%s%s%s%s%s%s%s%s%s", style.Render(part00), style.Render(part01), style.Render(part02), style.Render(part03), style.Render(part1), text1, style.Render(part2), style.Render(part25), text2, style.Render(part3), text3, style.Render(part4), text4)
-	offset := lipgloss.NewStyle().MarginLeft((m.width - 58) / 2)
+	offset := lipgloss.NewStyle().MarginLeft((m.gsd.width - 58) / 2)
 	return offset.Render(s)
 }
 
