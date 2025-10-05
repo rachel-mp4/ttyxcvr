@@ -340,10 +340,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	case dialMsg:
-		if len(msg.value) == 1 {
-			m.gsd.state = DialingChannel
-			return m, m.dialingChannel(msg.value)
-		}
+		m.gsd.state = DialingChannel
+		return m, m.dialingChannel(msg.value)
 
 	case loginMsg:
 		if len(msg.value) == 2 {
@@ -439,6 +437,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ConnectingToChannel:
 		return m.updateConnectingToChannel(msg)
 	case DialingChannel:
+		return m.updateDialingChannel(msg)
 
 	case Connected:
 		cm, cmd, err := m.cm.updateConnected(msg)
@@ -982,8 +981,12 @@ func (m model) updateDialingChannel(msg tea.Msg) (tea.Model, tea.Cmd) {
 		draft.Width = m.gsd.width - len(draft.Prompt) - 1
 		cm.draft = draft
 		go startLRCHandlers(msg.conn, m.gsd.nick, m.gsd.handle, m.gsd.color)
+		cm.lrcconn = msg.conn
+		cm.datachan = make(chan []byte)
+		cm.wsurl = msg.wsurl
 		m.cm = &cm
 		m.clm = nil
+		go LRCWriter(cm.lrcconn, cm.datachan)
 	}
 	return m, nil
 }
@@ -1132,13 +1135,14 @@ func (m model) dialingChannel(url string) tea.Cmd {
 			cancel()
 			return errMsg{err}
 		}
-		return connSimpleMsg{conn, cancel}
+		return connSimpleMsg{conn, cancel, url}
 	}
 }
 
 type connSimpleMsg struct {
 	conn   *websocket.Conn
 	cancel func()
+	wsurl  string
 }
 
 func (m model) connectToChannel(ctx context.Context, cancel func(), wsurl string) tea.Cmd {
@@ -1282,6 +1286,8 @@ func (m model) View() string {
 		return m.clm.channelListView(m.cmding, pv)
 	case ResolvingChannel:
 		return "resolving channel"
+	case DialingChannel:
+		return "dialing channel"
 	case ConnectingToChannel:
 		return m.connectingView()
 	case Connected:
