@@ -1112,12 +1112,7 @@ type connwriterexitMsg struct{}
 func (m model) updateResolvingChannel(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case resolutionMsg:
-		c := m.clm.curchannel()
-		var host string
-		if c != nil {
-			host = c.Host
-		}
-		wsurl := fmt.Sprintf("%s%s", host, msg.resolution.URL)
+		wsurl := fmt.Sprintf("%s%s", strings.TrimPrefix(msg.channelhost, "https://"), msg.resolution.URL)
 		m.gsd.state = ConnectingToChannel
 		ctx, cancel := context.WithCancel(context.Background())
 		return m, m.connectToChannel(ctx, cancel, wsurl)
@@ -1240,11 +1235,42 @@ func (clm channellistmodel) updateChannelList(msg tea.Msg) (channellistmodel, te
 func ResolveChannel(host string, did string, rkey string) tea.Cmd {
 	return func() tea.Msg {
 		c := &http.Client{Timeout: 10 * time.Second}
-		res, err := c.Get(fmt.Sprintf("http://%s/xrpc/org.xcvr.actor.resolveChannel?did=%s&rkey=%s", host, did, rkey))
-
+		var res *http.Response
+		var err error
+		if strings.HasPrefix(host, "did:web:") {
+			res, err = c.Get(fmt.Sprintf("https://%s/.well-known/did.json", strings.TrimPrefix(host, "did:web:")))
+		} else if !strings.HasPrefix(host, "did:plc") {
+			res, err = c.Get(fmt.Sprintf("https://plc.directory/%s", host))
+		} else {
+			err = errors.New("unsupported method")
+		}
 		if err != nil {
 			return errMsg{err}
 		}
+		dec := json.NewDecoder(res.Body)
+		var diddoc struct {
+			Services []struct {
+				Id              string `json:"id"`
+				ServiceEndpoint string `json:"serviceEndpoint"`
+			} `json:"service"`
+		}
+		dec.Decode(&diddoc)
+		if diddoc.Services == nil {
+			return errMsg{errors.New("no services")}
+
+		}
+		var url string
+		for _, s := range diddoc.Services {
+			if s.Id != "#xcvr_ch" {
+				continue
+			}
+			url = s.ServiceEndpoint
+		}
+		if url == "" {
+			return errMsg{errors.New("no serviceEndpoint")}
+		}
+		res, err = c.Get(fmt.Sprintf("%s/xrpc/org.xcvr.actor.resolveChannel?did=%s&rkey=%s", url, did, rkey))
+
 		if res.StatusCode != 200 {
 			return errMsg{errors.New(fmt.Sprintf("error resolving channel: %d", res.StatusCode))}
 		}
@@ -1254,12 +1280,13 @@ func ResolveChannel(host string, did string, rkey string) tea.Cmd {
 		if err != nil {
 			return errMsg{err}
 		}
-		return resolutionMsg{resolution}
+		return resolutionMsg{resolution, url}
 	}
 }
 
 type resolutionMsg struct {
-	resolution Resolution
+	resolution  Resolution
+	channelhost string
 }
 
 type Resolution struct {
